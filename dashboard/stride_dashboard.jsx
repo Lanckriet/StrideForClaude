@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 // Version — keep in sync with CLI's STRIDE_VERSION and the VERSION file.
 // See versioning guidelines in cctrack.py for when to bump.
 // ---------------------------------------------------------------------------
-const STRIDE_VERSION = "0.1.1";
+const STRIDE_VERSION = "0.2.0";
 
 const G = {
   50: "#EDFCF2", 100: "#C8F5D6", 200: "#8DEBAE", 300: "#4FD882",

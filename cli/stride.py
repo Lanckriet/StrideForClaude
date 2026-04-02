@@ -52,14 +52,18 @@ No wrapper needed. No stdout parsing. Uses the same data source as ccusage/toksc
 #   5. Tag the commit: git tag v0.x.x
 # ---------------------------------------------------------------------------
 
-STRIDE_VERSION = "0.1.1"
+STRIDE_VERSION = "0.2.0"
 
 import sys
 import os
 import json
 import csv
+import re
 import sqlite3
-import readline  # noqa: F401 — imported for side effect: enables arrow-key history in input()
+try:
+    import readline  # noqa: F401 — Unix: enables arrow-key history in input()
+except ImportError:
+    pass  # Windows: not available, input() still works fine without it
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -218,6 +222,100 @@ def estimate_cost(tokens: dict, model: str) -> float:
     return round(cost, 6)
 
 
+def auto_tag(
+    languages: set[str],
+    tools_used: set[str],
+    file_paths: set[str],
+    user_text: str,
+    code_generated: bool,
+) -> str | None:
+    """Infer task tags from session signals. Returns comma-separated tags or None."""
+    tags = set()
+    paths_lower = {p.lower().replace("\\", "/") for p in file_paths}
+
+    # --- Salesforce: Apex ---
+    if "apex" in languages:
+        tags.add("apex")
+    if any(p.endswith((".cls", ".trigger")) for p in paths_lower):
+        tags.add("apex")
+    apex_kw = re.search(r"\b(apex|soql|sobject|trigger|@istest|testmethod|auraenabled)\b", user_text)
+    if apex_kw:
+        tags.add("apex")
+
+    # --- Salesforce: LWC ---
+    if any("/lwc/" in p for p in paths_lower):
+        tags.add("lwc")
+    lwc_kw = re.search(r"\b(lwc|lightning web component|lightning-\w+|@api|@track|@wire)\b", user_text)
+    if lwc_kw:
+        tags.add("lwc")
+    # JS/HTML inside an LWC folder → lwc, not scripting
+    if any("/lwc/" in p and p.endswith((".js", ".html", ".css")) for p in paths_lower):
+        tags.add("lwc")
+
+    # --- Salesforce: Flow ---
+    if any(p.endswith(".flow-meta.xml") for p in paths_lower):
+        tags.add("flow")
+    if any("/flows/" in p or "/flow/" in p for p in paths_lower):
+        tags.add("flow")
+    flow_kw = re.search(r"\b(flow|screen flow|record-triggered|autolaunched flow|flow builder|subflow)\b", user_text)
+    if flow_kw:
+        tags.add("flow")
+
+    # --- Salesforce: Config (metadata, admin, declarative) ---
+    config_exts = (".object-meta.xml", ".field-meta.xml", ".profile-meta.xml",
+                   ".permissionset-meta.xml", ".layout-meta.xml", ".app-meta.xml",
+                   ".flexipage-meta.xml", ".tab-meta.xml", ".quickAction-meta.xml",
+                   ".labels-meta.xml", ".remoteSite-meta.xml", ".namedCredential-meta.xml")
+    if any(any(p.endswith(ext) for ext in config_exts) for p in paths_lower):
+        tags.add("config")
+    config_kw = re.search(
+        r"\b(metadata|custom object|custom field|permission set|profile|page layout|"
+        r"validation rule|sfdx|sf deploy|scratch org|sandbox|package\.xml)\b", user_text
+    )
+    if config_kw:
+        tags.add("config")
+
+    # --- Scripting (Python, Bash, general JS/TS not in LWC) ---
+    scripting_langs = {"python", "bash", "sql", "soql"}
+    if languages & scripting_langs:
+        tags.add("scripting")
+    # JS/TS that is NOT inside lwc folders → scripting
+    non_lwc_js = any(
+        p.endswith((".js", ".ts", ".jsx", ".tsx")) and "/lwc/" not in p
+        for p in paths_lower
+    )
+    if non_lwc_js and ("javascript" in languages or "typescript" in languages):
+        tags.add("scripting")
+    script_kw = re.search(r"\b(script|automate|cron|batch|etl|migration|data load|anonymous apex)\b", user_text)
+    if script_kw:
+        tags.add("scripting")
+
+    # --- Docs ---
+    if "markdown" in languages:
+        tags.add("docs")
+    if any(p.endswith((".md", ".txt", ".rst")) for p in paths_lower):
+        tags.add("docs")
+    docs_kw = re.search(r"\b(readme|documentation|doc|wiki|changelog|release notes|comment)\b", user_text)
+    if docs_kw:
+        tags.add("docs")
+
+    # --- Review (read-heavy, no code gen) ---
+    read_tools = {"Read", "Grep", "Glob", "Search"}
+    if not code_generated and tools_used and tools_used <= (read_tools | {"Bash", "Agent"}):
+        tags.add("review")
+    review_kw = re.search(r"\b(review|explain|understand|analyze|audit|investigate|debug|diagnose|what does)\b", user_text)
+    if review_kw and not code_generated:
+        tags.add("review")
+
+    # --- Fallback: if nothing matched, tag as 'other' ---
+    if not tags:
+        tags.add("other")
+
+    # Only keep tags that are in the canonical set
+    tags &= set(TASK_TAGS)
+    return ",".join(sorted(tags)) if tags else None
+
+
 def parse_jsonl_session(filepath: Path) -> dict | None:
     """Parse a Claude Code JSONL session file into a session summary."""
     lines = []
@@ -251,6 +349,9 @@ def parse_jsonl_session(filepath: Path) -> dict | None:
     languages = set()
     code_generated = False
     first_user_prompt = None
+    # Richer signals for auto-tagging
+    user_text_parts = []          # all user message text (for keyword matching)
+    file_paths_touched = set()    # every file path seen in tool calls (read + write)
 
     for entry in lines:
         if "sessionId" in entry:
@@ -269,18 +370,22 @@ def parse_jsonl_session(filepath: Path) -> dict | None:
 
         if role == "user":
             user_msgs += 1
-            if first_user_prompt is None:
-                content = msg.get("content", "")
-                if isinstance(content, str):
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                if first_user_prompt is None:
                     first_user_prompt = content
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            first_user_prompt = block.get("text", "")
-                            break
-                        elif isinstance(block, str):
+                user_text_parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        if first_user_prompt is None:
+                            first_user_prompt = text
+                        user_text_parts.append(text)
+                    elif isinstance(block, str):
+                        if first_user_prompt is None:
                             first_user_prompt = block
-                            break
+                        user_text_parts.append(block)
 
         elif role == "assistant":
             assistant_msgs += 1
@@ -304,14 +409,16 @@ def parse_jsonl_session(filepath: Path) -> dict | None:
                         tool_call_count += 1
                         tool_name = block.get("name", "")
                         tools_used.add(tool_name)
+                        tool_input = block.get("input", {})
+                        # Collect file paths from any tool that references files
+                        file_path = tool_input.get("file_path", "") or tool_input.get("path", "")
+                        if file_path:
+                            file_paths_touched.add(file_path)
+                            ext = Path(file_path).suffix.lower()
+                            if ext in EXT_LANG:
+                                languages.add(EXT_LANG[ext])
                         if tool_name in CODE_TOOLS:
                             code_generated = True
-                            tool_input = block.get("input", {})
-                            file_path = tool_input.get("file_path", "")
-                            if file_path:
-                                ext = Path(file_path).suffix.lower()
-                                if ext in EXT_LANG:
-                                    languages.add(EXT_LANG[ext])
 
     if not session_id:
         session_id = filepath.stem
@@ -335,7 +442,10 @@ def parse_jsonl_session(filepath: Path) -> dict | None:
 
     cost = estimate_cost(tokens, primary_model)
 
-    return {
+    # Combine all user text for keyword analysis (cap at 5000 chars to stay lean)
+    user_text_blob = " ".join(user_text_parts)[:5000].lower()
+
+    session_data = {
         "session_id": session_id,
         "project_dir": project_dir,
         "project_name": project_name,
@@ -360,6 +470,17 @@ def parse_jsonl_session(filepath: Path) -> dict | None:
         "exit_status": None,
         "prompt_summary": prompt_summary,
     }
+
+    # Auto-tag using all available signals
+    session_data["auto_tags"] = auto_tag(
+        languages=languages,
+        tools_used=tools_used,
+        file_paths=file_paths_touched,
+        user_text=user_text_blob,
+        code_generated=code_generated,
+    )
+
+    return session_data
 
 
 def _validate_since(since: str) -> str | None:
@@ -414,14 +535,15 @@ def _upsert_fields():
 
 def sync_sessions(since: str | None = None) -> int:
     conn = get_db()
-    existing = set(
-        row["session_id"]
-        for row in conn.execute("SELECT session_id FROM sessions").fetchall()
-    )
+    existing = {
+        row["session_id"]: row["tags"]
+        for row in conn.execute("SELECT session_id, tags FROM sessions").fetchall()
+    }
 
     files = find_jsonl_files(since)
     new_count = 0
     updated_count = 0
+    auto_tagged = 0
     now = datetime.now(timezone.utc).isoformat()
 
     for f in files:
@@ -430,6 +552,7 @@ def sync_sessions(since: str | None = None) -> int:
             continue
 
         sid = session["session_id"]
+        auto_tags = session.get("auto_tags")
         fields = _upsert_fields()
 
         if sid in existing:
@@ -437,6 +560,10 @@ def sync_sessions(since: str | None = None) -> int:
             set_clause = ", ".join(f"{f}=?" for f in fields) + ", synced_at=?"
             values = [session[f] for f in fields] + [now, sid]
             conn.execute(f"UPDATE sessions SET {set_clause} WHERE session_id=?", values)
+            # Refresh auto-tags only when no manual tags have been set
+            if not existing[sid] and auto_tags:
+                conn.execute("UPDATE sessions SET tags=? WHERE session_id=?", (auto_tags, sid))
+                auto_tagged += 1
             updated_count += 1
         else:
             insert_fields = (
@@ -447,20 +574,24 @@ def sync_sessions(since: str | None = None) -> int:
                 "total_messages", "user_messages", "assistant_messages",
                 "tool_calls", "tools_used", "code_generated",
                 "languages_detected", "duration_ms", "estimated_cost_usd",
-                "exit_status", "prompt_summary", "synced_at",
+                "exit_status", "prompt_summary", "tags", "synced_at",
             )
             placeholders = ",".join("?" * len(insert_fields))
-            values = [session.get(f) for f in insert_fields[:-1]] + [now]
+            values = [session.get(f) for f in insert_fields[:-2]] + [auto_tags, now]
             conn.execute(
                 f"INSERT INTO sessions ({','.join(insert_fields)}) VALUES ({placeholders})",
                 values,
             )
+            if auto_tags:
+                auto_tagged += 1
             new_count += 1
-            existing.add(sid)
+            existing[sid] = auto_tags
 
     conn.commit()
     conn.close()
     print(f"Synced: {new_count} new, {updated_count} updated from {len(files)} JSONL files.")
+    if auto_tagged:
+        print(f"Auto-tagged: {auto_tagged} sessions.")
     return new_count + updated_count
 
 
